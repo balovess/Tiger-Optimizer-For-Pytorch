@@ -1,8 +1,8 @@
-[[中文](README.md)|English]
+[[中文](README_CN.md)|English]
 
-# Tiger
+# Tiger: A Budget-Conscious Neural Network Optimizer for PyTorch
 
-A **Tig**ht-fisted Optimiz**er**, an optimizer that is extremely budget-conscious!
+Tiger is an optimizer designed for cost-conscious neural network training. It started as a TensorFlow project ([original repository](https://github.com/bojone/tiger/)), and this repository is a PyTorch adaptation of the original codebase.
 
 ## Features
 
@@ -12,3 +12,4 @@ A **Tig**ht-fisted Optimiz**er**, an optimizer that is extremely budget-consciou
 - Simple strategy to prevent the model from collapsing to NaN.
 - Can simulate any lr schedule with piecewise linear learning rates.
 
+We would like to express our gratitude to the original TensorFlow project ([bojone/tiger](https://github.com/bojone/tiger/)) and its contributors for inspiring and providing the foundation for this PyTorch adaptation.
