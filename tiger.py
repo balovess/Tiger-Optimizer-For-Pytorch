@@ -55,8 +55,9 @@ class Tiger(optim.Optimizer):
 
                 state = self.state[p]
 
-                if len(state) == 0:
+                if 'step' not in state:
                     state['step'] = 0
+                if 'm' not in state:
                     state['m'] = torch.zeros_like(p.data)
 
                 t = state['step']
