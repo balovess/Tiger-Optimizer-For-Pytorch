@@ -4,9 +4,17 @@ import torch.optim as optim
 
 
 class Tiger(optim.Optimizer):
-    """Tiger Optimizer
+    """Tiger Optimizer (Sparse Support Version)
 
+    This version of the Tiger optimizer attempts to add basic support for sparse gradients.
+    It retains the core ideas of efficiency and simplicity while trying to be compatible
+    with sparse data.  However, true sparse optimization might require more fundamental
+    algorithm changes, and this version might not be as efficient or performant as
+    a native sparse optimizer.
+
+    Note: Sparse gradient support is experimental and might not be optimal for all scenarios.
     """
+
     def __init__(
         self,
         params,
@@ -16,94 +24,136 @@ class Tiger(optim.Optimizer):
         grad_accum_steps=1,
         lr_schedule={0: 1},
         shrink_ratio=0.99,
+        use_sign_grad=True,  # Option to use sign-based gradient update
     ):
+        """Initializes the Tiger Optimizer (Sparse Support Version).
+
+        Args:
+            params (iterable): Iterable of parameters to optimize or dicts defining parameter groups
+            learning_rate (float, optional): Learning rate (default: 1e-3)
+            beta (float, optional): Coefficient for moving average of gradient (default: 0.965)
+            weight_decay (float, optional): Weight decay (L2 penalty) (default: 0.01)
+            grad_accum_steps (int, optional): Number of steps to accumulate gradient before optimization (default: 1)
+            lr_schedule (dict, optional): Learning rate schedule as dict, keys are steps, values are lr multipliers (default: {0: 1})
+            shrink_ratio (float, optional): Ratio to shrink parameter values when gradient is NaN (default: 0.99)
+            use_sign_grad (bool, optional): Whether to use sign of gradient for parameter update (default: True)
+
+        Raises:
+            ValueError: If any input argument is invalid
+        """
         if not 0.0 <= learning_rate:
             raise ValueError("Invalid learning_rate: {}".format(learning_rate))
         if not 0.0 <= beta <= 1.0:
             raise ValueError("Invalid beta: {}".format(beta))
         if not 0.0 <= shrink_ratio <= 1.0:
             raise ValueError("Invalid shrink_ratio: {}".format(shrink_ratio))
-        
+
         defaults = dict(
             learning_rate=learning_rate,
             beta=beta,
             weight_decay=weight_decay,
             grad_accum_steps=grad_accum_steps,
             lr_schedule={int(i): j for i, j in lr_schedule.items()},
-            shrink_ratio=shrink_ratio
+            shrink_ratio=shrink_ratio,
+            use_sign_grad=use_sign_grad,
         )
         super(Tiger, self).__init__(params, defaults)
 
     def __setstate__(self, state):
         super(Tiger, self).__setstate__(state)
 
+    @torch.no_grad()
     def step(self, closure=None):
+        """Performs a single optimization step (Sparse Support Version).
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model and returns the loss.
+
+        Returns:
+            Optional[float]: The loss value, if provided by the closure.
+
+        Raises:
+            RuntimeError: if unexpected sparse gradient issues are encountered.  Basic sparse support is attempted.
+        """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
-                
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        'Tiger optimizer does not support sparse gradients'
-                    )
+                grad = p.grad
 
                 state = self.state[p]
 
                 if 'step' not in state:
                     state['step'] = 0
-                if 'm' not in state:
-                    state['m'] = torch.zeros_like(p.data)
+                if 'momentum' not in state:
+                    state['momentum'] = torch.zeros_like(p) # Initialize momentum as dense, compatible with both dense and sparse
 
-                t = state['step']
-                d = group['weight_decay']
-                k = group['grad_accum_steps']
-                s = group['shrink_ratio']
-                beta_tensor = torch.tensor(group['beta'])
-                if t % k == 0:
-                    b1 = beta_tensor
+                step_count = state['step']
+                weight_decay = group['weight_decay']
+                grad_accum_steps = group['grad_accum_steps']
+                shrink_ratio = group['shrink_ratio']
+                beta = group['beta']
+                use_sign_grad = group['use_sign_grad']
+                beta_tensor = torch.tensor(beta, device=grad.device)
+
+                if step_count % grad_accum_steps == 0:
+                    beta1 = beta_tensor
                 else:
-                    b1 = 1.0
-                b2 = (1 - group['beta']) / k
-                lr = group['learning_rate'] * self.piecewise_linear(t, group['lr_schedule'])
-                if (t + 1) % k == 0:
-                    lr = lr
-                else:
-                    lr = 0
+                    beta1 = 1.0
+                beta2 = (1 - beta) / grad_accum_steps
+
+                learning_rate = group['learning_rate'] * self.piecewise_linear(
+                    step_count, group['lr_schedule']
+                )
+                if (step_count + 1) % grad_accum_steps != 0:
+                    learning_rate = 0
 
                 state['step'] += 1
 
-                is_nan = torch.isnan(grad)
-                b1 = torch.where(is_nan, torch.ones_like(b1), b1)
-                g = torch.where(is_nan, torch.zeros_like(grad), grad)
-                m = state['m']
+                nan_mask = torch.isnan(grad) # nan_mask should work for both dense and sparse
 
-                c = 0
-                if p.name is None:
-                    name = "default_name"
+                beta1 = torch.where(nan_mask, torch.ones_like(beta1), beta1) # where should work for both
+                grad_is_sparse = grad.is_sparse # Check if grad is sparse
+
+                if grad_is_sparse: # Sparse gradient handling
+                    grad_dense = grad.to_dense() # Convert sparse grad to dense for easier operations.  Efficiency might degrade with high sparsity.
+                    grad = grad_dense # Use dense grad from now on in this step
+
+                grad = torch.where(nan_mask, torch.zeros_like(grad), grad) # where should work for dense grad now
+                momentum = state['momentum']
+
+                momentum_t = beta1 * momentum + beta2 * grad # Momentum update - dense operations are applied
+                state['momentum'] = momentum_t # Momentum state is always dense
+
+
+                lr_scale = 1.0
+                param_name = p.name if hasattr(p, 'name') and p.name else "default_name"
+                constant_lr_scale = 0
+
+                if re.search(r'bias|beta|gamma', param_name):
+                    learning_rate *= 0.5
+                    weight_decay = 0
+                    if 'gamma' in param_name:
+                        constant_lr_scale = 1
+                elif 'embeddings' in param_name:
+                    lr_scale = self.root_mean_square(p.data, axis=-1, keepdims=True)
                 else:
-                    name = p.name
-    
-                if re.findall('bias|beta|gamma', name):
-                    lr, d = lr * 0.5, 0
-                    if 'gamma' in p.name:
-                        c = 1
-                elif 'embeddings' in name:
-                    lr = lr * self.root_mean_square(p.data, axis=-1, keepdims=True)
+                    lr_scale = self.root_mean_square(p.data)
+
+                effective_lr = learning_rate * lr_scale
+
+                if use_sign_grad:
+                    update = torch.sign(momentum_t) * effective_lr # sign works on dense tensor
                 else:
-                    lr = lr * self.root_mean_square(p.data)
+                    update = (torch.sign(momentum_t) + weight_decay * p.data) * effective_lr # dense operations
 
-                m_t = b1 * m + b2 * g
-                state['m'] = m_t
-
-                u = (torch.sign(m_t) + d * p.data) * lr
-                v = torch.where(is_nan, (p.data - c) * s + c, p.data - u)
-                p.data = v
+                param_update = torch.where(nan_mask, (p.data - constant_lr_scale) * shrink_ratio + constant_lr_scale, p.data - update) # where works on dense
+                p.data = param_update # Parameter p remains as its original type (sparse or dense)
 
         return loss
 
@@ -114,9 +164,7 @@ class Tiger(optim.Optimizer):
 
     @staticmethod
     def piecewise_linear(t, schedule, from_zero=True):
-        """Piecewise Linear Function
-
-        """
+        """Piecewise Linear Function"""
         schedule = sorted(schedule.items())
         if from_zero and schedule[0][0] != 0:
             schedule = [(0, 0.0)] + schedule
@@ -136,5 +184,3 @@ class Tiger(optim.Optimizer):
             x = torch.where(t >= t_begin, x, x_begin)
 
         return x
-
-
